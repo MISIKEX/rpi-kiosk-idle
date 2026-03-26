@@ -429,7 +429,7 @@ start_browser() {
   flags+=(--ozone-platform=wayland)
   flags+=(--no-first-run)
   flags+=(--simulate-outdated-no-au)
-  flags+=(--disable-features=Translate)
+  flags+=(--disable-features=TranslateUI,Translate)
 
   if [ "$INCOGNITO_MODE" = "y" ]; then
     flags+=(--incognito)
@@ -504,6 +504,23 @@ PYCODE
   rm -f "$tmp_file"
 }
 
+write_chromium_translate_policy() {
+  local policy_dir="/etc/chromium/policies/managed"
+  local policy_file="$policy_dir/99-kiosk-disable-translate.json"
+  local tmp_file
+
+  tmp_file=$(mktemp)
+  cat > "$tmp_file" <<'EOF'
+{
+  "TranslateEnabled": false
+}
+EOF
+
+  sudo mkdir -p "$policy_dir"
+  sudo install -m 644 "$tmp_file" "$policy_file"
+  rm -f "$tmp_file"
+}
+
 # =========================
 # 6) labwc autostart: Chromium indítás (KIOSKPARANCS blokkba, memóriából)
 # =========================
@@ -565,6 +582,9 @@ if ask_user "Szeretnél Chromium autostartot létrehozni labwc-hez?" "y"; then
 
   write_kiosk_browser_helper "$USER_URL" "$IDLE_URL" "$IDLE_MODE" "$INCOGNITO_MODE" "$USE_NET_WAIT" "$PING_HOST" "$MAX_WAIT" "$CHROMIUM_BIN"
   echo -e "\e[32m✔\e[0m Kioszk böngésző segédscript frissítve: $KIOSK_BROWSER_HELPER"
+
+  write_chromium_translate_policy
+  echo -e "\e[32m✔\e[0m Chromium fordítás letiltó policy frissítve: /etc/chromium/policies/managed/99-kiosk-disable-translate.json"
 
   AUTOSTART_NEEDS_UPDATE="y"
   if [ -z "$AUTOSTART_BLOCK" ]; then
