@@ -68,6 +68,24 @@ ask_user() {
   done
 }
 
+ask_positive_integer() {
+  local prompt="$1"
+  local default="$2"
+  local value
+
+  while true; do
+    read -p "$prompt [alapértelmezett: $default]: " value
+    value="${value:-$default}"
+
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+
+    echo "Kérlek egy 0-nál nagyobb egész számot adj meg."
+  done
+}
+
 # =========================
 # KIOSKPARANCS blokkok kezelése
 # =========================
@@ -216,6 +234,7 @@ CONFIG_BLOCK=""
 CMDLINE_NEEDS_SPLASH="n"
 CMDLINE_NEEDS_CONSOLE_TTY3="n"
 CMDLINE_VIDEO_VALUE=""   # pl. HDMI-A-1:1920x1080@60
+KIOSK_BROWSER_HELPER="/usr/local/bin/kiosk-browser-switch.sh"
 
 # =========================
 # 1) Csomaglista frissítése?
@@ -343,6 +362,149 @@ else
 fi
 
 # =========================
+# Segédscript létrehozása a Chromium kioszk váltásához
+# =========================
+write_kiosk_browser_helper() {
+  local main_url="$1"
+  local idle_url="$2"
+  local idle_enabled="$3"
+  local incognito_mode="$4"
+  local use_net_wait="$5"
+  local ping_host="$6"
+  local max_wait="$7"
+  local chromium_bin="$8"
+
+  local main_url_escaped idle_url_escaped chromium_bin_escaped ping_host_escaped
+  local tmp_file
+
+  main_url_escaped=$(printf "%s" "$main_url" | sed -e "s/'/'\\''/g" -e "s/[&|]/\\&/g")
+  idle_url_escaped=$(printf "%s" "$idle_url" | sed -e "s/'/'\\''/g" -e "s/[&|]/\\&/g")
+  chromium_bin_escaped=$(printf "%s" "$chromium_bin" | sed -e "s/'/'\\''/g" -e "s/[&|]/\\&/g")
+  ping_host_escaped=$(printf "%s" "$ping_host" | sed -e "s/'/'\\''/g" -e "s/[&|]/\\&/g")
+  tmp_file=$(mktemp)
+
+  cat > "$tmp_file" <<'EOF'
+#!/bin/bash
+set -e
+
+MODE="${1:-work}"
+STATE_FILE="/tmp/kiosk-browser-mode"
+MAIN_URL='__MAIN_URL__'
+IDLE_URL='__IDLE_URL__'
+IDLE_ENABLED=__IDLE_ENABLED__
+INCOGNITO_MODE=__INCOGNITO_MODE__
+USE_NET_WAIT=__USE_NET_WAIT__
+PING_HOST='__PING_HOST__'
+MAX_WAIT=__MAX_WAIT__
+CHROMIUM_BIN='__CHROMIUM_BIN__'
+
+wait_for_network() {
+  if [ "$USE_NET_WAIT" != "y" ]; then
+    return 0
+  fi
+
+  local ok=0
+  local i
+  for i in $(seq 1 "$MAX_WAIT"); do
+    if ping -c 1 -W 2 "$PING_HOST" > /dev/null 2>&1; then
+      ok=1
+      sleep 2
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "$ok" -ne 1 ]; then
+    echo "[KIOSK] FIGYELEM: nincs hálózat $MAX_WAIT mp után sem, a Chromium így is indul." >&2
+    sleep 2
+  fi
+}
+
+start_browser() {
+  local target_url="$1"
+  local flags=()
+
+  flags+=(--autoplay-policy=no-user-gesture-required)
+  flags+=(--enable-features=UseOzonePlatform)
+  flags+=(--ozone-platform=wayland)
+  flags+=(--no-first-run)
+  flags+=(--simulate-outdated-no-au)
+  flags+=(--disable-features=Translate)
+
+  if [ "$INCOGNITO_MODE" = "y" ]; then
+    flags+=(--incognito)
+  fi
+
+  flags+=(--kiosk "$target_url")
+
+  nohup "$CHROMIUM_BIN" "${flags[@]}" > /tmp/kiosk-browser.log 2>&1 &
+}
+
+case "$MODE" in
+  work)
+    TARGET_URL="$MAIN_URL"
+    ;;
+  idle)
+    if [ "$IDLE_ENABLED" != "y" ]; then
+      exit 0
+    fi
+    TARGET_URL="$IDLE_URL"
+    ;;
+  *)
+    echo "Ismeretlen mód: $MODE" >&2
+    exit 1
+    ;;
+esac
+
+if [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE")" = "$MODE" ]; then
+  if pgrep -af chromium | grep -q -- '--kiosk'; then
+    exit 0
+  fi
+fi
+
+echo "$MODE" > "$STATE_FILE"
+pkill -f 'chromium.*--kiosk' > /dev/null 2>&1 || true
+pkill -f 'chromium-browser.*--kiosk' > /dev/null 2>&1 || true
+sleep 1
+wait_for_network
+start_browser "$TARGET_URL"
+EOF
+
+  MAIN_URL_ESCAPED="$main_url_escaped" \
+  IDLE_URL_ESCAPED="$idle_url_escaped" \
+  IDLE_ENABLED_VALUE="$idle_enabled" \
+  INCOGNITO_MODE_VALUE="$incognito_mode" \
+  USE_NET_WAIT_VALUE="$use_net_wait" \
+  PING_HOST_ESCAPED="$ping_host_escaped" \
+  MAX_WAIT_VALUE="$max_wait" \
+  CHROMIUM_BIN_ESCAPED="$chromium_bin_escaped" \
+  python3 - "$tmp_file" <<'PYCODE'
+from pathlib import Path
+import os
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+replacements = {
+    '__MAIN_URL__': os.environ['MAIN_URL_ESCAPED'],
+    '__IDLE_URL__': os.environ['IDLE_URL_ESCAPED'],
+    '__IDLE_ENABLED__': os.environ['IDLE_ENABLED_VALUE'],
+    '__INCOGNITO_MODE__': os.environ['INCOGNITO_MODE_VALUE'],
+    '__USE_NET_WAIT__': os.environ['USE_NET_WAIT_VALUE'],
+    '__PING_HOST__': os.environ['PING_HOST_ESCAPED'],
+    '__MAX_WAIT__': os.environ['MAX_WAIT_VALUE'],
+    '__CHROMIUM_BIN__': os.environ['CHROMIUM_BIN_ESCAPED'],
+}
+for key, value in replacements.items():
+    text = text.replace(key, value)
+path.write_text(text)
+PYCODE
+
+  sudo install -m 755 "$tmp_file" "$KIOSK_BROWSER_HELPER"
+  rm -f "$tmp_file"
+}
+
+# =========================
 # 6) labwc autostart: Chromium indítás (KIOSKPARANCS blokkba, memóriából)
 # =========================
 echo
@@ -351,9 +513,9 @@ if ask_user "Szeretnél Chromium autostartot létrehozni labwc-hez?" "y"; then
   USER_URL="${USER_URL:-https://planka.athq.cc}"
 
   echo
-  INCOGNITO_FLAG=""
+  INCOGNITO_MODE="n"
   if ask_user "Induljon a böngésző inkognitó módban?" "n"; then
-    INCOGNITO_FLAG="--incognito "
+    INCOGNITO_MODE="y"
   fi
 
   echo
@@ -367,8 +529,26 @@ if ask_user "Szeretnél Chromium autostartot létrehozni labwc-hez?" "y"; then
   if [ "$USE_NET_WAIT" = "y" ]; then
     read -p "Add meg a pingelendő hostot a hálózati ellenőrzéshez [alapértelmezett: 8.8.8.8]: " PING_HOST_IN
     PING_HOST="${PING_HOST_IN:-8.8.8.8}"
-    read -p "Add meg a maximális várakozási időt másodpercben [alapértelmezett: 30]: " MAX_WAIT_IN
-    MAX_WAIT="${MAX_WAIT_IN:-30}"
+    MAX_WAIT="$(ask_positive_integer "Add meg a maximális várakozási időt másodpercben" "30")"
+  fi
+
+  echo
+  IDLE_MODE="n"
+  if ask_user "Szeretnéd bekapcsolni az idle képernyőt?" "y"; then
+    IDLE_MODE="y"
+
+    if ! command -v swayidle > /dev/null 2>&1; then
+      echo -e "\e[90mswayidle telepítése folyamatban, kérlek várj...\e[0m"
+      sudo apt install --no-install-recommends -y swayidle > /dev/null 2>&1 &
+      spinner $! "swayidle telepítése..."
+    fi
+
+    read -p "Add meg az idle képernyő URL-jét [alapértelmezett: https://kiosk.athq.cc]: " IDLE_URL
+    IDLE_URL="${IDLE_URL:-https://kiosk.athq.cc}"
+    IDLE_TIMEOUT="$(ask_positive_integer "Add meg az idle várakozási időt másodpercben" "120")"
+  else
+    IDLE_URL="https://kiosk.athq.cc"
+    IDLE_TIMEOUT="120"
   fi
 
   CHROMIUM_BIN="$(command -v chromium || command -v chromium-browser || true)"
@@ -383,42 +563,35 @@ if ask_user "Szeretnél Chromium autostartot létrehozni labwc-hez?" "y"; then
     fi
   fi
 
-  # Extra kapcsolók: kevesebb felugró (első futás / fordítás)
-  CHROME_FLAGS="${INCOGNITO_FLAG}--autoplay-policy=no-user-gesture-required --enable-features=UseOzonePlatform --ozone-platform=wayland --no-first-run --simulate-outdated-no-au --disable-features=Translate --kiosk \"${USER_URL}\""
+  write_kiosk_browser_helper "$USER_URL" "$IDLE_URL" "$IDLE_MODE" "$INCOGNITO_MODE" "$USE_NET_WAIT" "$PING_HOST" "$MAX_WAIT" "$CHROMIUM_BIN"
+  echo -e "\e[32m✔\e[0m Kioszk böngésző segédscript frissítve: $KIOSK_BROWSER_HELPER"
 
   AUTOSTART_NEEDS_UPDATE="y"
   if [ -z "$AUTOSTART_BLOCK" ]; then
-    AUTOSTART_BLOCK+="# labwc autostart - kioszk beállítások\n"
-    AUTOSTART_BLOCK+="# Ezt a blokkot a kiosk setup script kezeli, kézzel ne szerkeszd a blokk két jelzője között.\n"
-    AUTOSTART_BLOCK+="\n"
+    AUTOSTART_BLOCK+="# labwc autostart - kioszk beállítások
+"
+    AUTOSTART_BLOCK+="# Ezt a blokkot a kiosk setup script kezeli, kézzel ne szerkeszd a blokk két jelzője között.
+"
+    AUTOSTART_BLOCK+="
+"
   fi
 
-  if [ "$USE_NET_WAIT" = "y" ]; then
-    AUTOSTART_BLOCK+="# Chromium indítása kioszk módban (hálózatra várással)\n"
-    AUTOSTART_BLOCK+="(\n"
-    AUTOSTART_BLOCK+="  NET_OK=0\n"
-    AUTOSTART_BLOCK+="  for i in \$(seq 1 ${MAX_WAIT}); do\n"
-    AUTOSTART_BLOCK+="    if ping -c 1 -W 2 ${PING_HOST} > /dev/null 2>&1; then\n"
-    AUTOSTART_BLOCK+="      NET_OK=1\n"
-    AUTOSTART_BLOCK+="      sleep 2\n"
-    AUTOSTART_BLOCK+="      break\n"
-    AUTOSTART_BLOCK+="    fi\n"
-    AUTOSTART_BLOCK+="    sleep 1\n"
-    AUTOSTART_BLOCK+="  done\n"
-    AUTOSTART_BLOCK+="\n"
-    AUTOSTART_BLOCK+="  if [ \"\$NET_OK\" -ne 1 ]; then\n"
-    AUTOSTART_BLOCK+="    echo \"[KIOSK] FIGYELEM: nincs hálózat ${MAX_WAIT} mp után sem, a Chromium így is indul.\" >&2\n"
-    AUTOSTART_BLOCK+="    sleep 2\n"
-    AUTOSTART_BLOCK+="  fi\n"
-    AUTOSTART_BLOCK+="\n"
-    AUTOSTART_BLOCK+="  ${CHROMIUM_BIN} ${CHROME_FLAGS}\n"
-    AUTOSTART_BLOCK+=") &\n"
-  else
-    AUTOSTART_BLOCK+="# Chromium indítása kioszk módban\n"
-    AUTOSTART_BLOCK+="${CHROMIUM_BIN} ${CHROME_FLAGS} &\n"
+  AUTOSTART_BLOCK+="# Chromium indítása kioszk módban
+"
+  AUTOSTART_BLOCK+="${KIOSK_BROWSER_HELPER} work &
+"
+
+  if [ "$IDLE_MODE" = "y" ]; then
+    AUTOSTART_BLOCK+="
+"
+    AUTOSTART_BLOCK+="# Idle képernyő kezelése inaktivitás esetén
+"
+    AUTOSTART_BLOCK+="(sleep 8 && swayidle -w timeout ${IDLE_TIMEOUT} '${KIOSK_BROWSER_HELPER} idle' resume '${KIOSK_BROWSER_HELPER} work') >/dev/null 2>&1 &
+"
   fi
 
-  AUTOSTART_BLOCK+="\n"
+  AUTOSTART_BLOCK+="
+"
 fi
 
 # =========================
