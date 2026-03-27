@@ -1,2 +1,2 @@
-# Raspberry Pi KIOSK IDLE MODE - Alu-Technika Kft.
+# Raspberry Pi KIOSK IDLE - Alu-Technika Kft.
 - www.alutechnika.hu
